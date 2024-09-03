@@ -1,0 +1,226 @@
+#!/usr/bin/bash
+
+# Copyright 2024 Alden Schwantes
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Check that curl is installed.
+if ! command -v curl &> /dev/null
+then
+ echo "curl could not be found"
+ exit 1
+fi
+
+# Check that jq is installed.
+if ! command -v jq &> /dev/null
+then
+ echo "jq could not be found"
+ exit 1
+fi
+
+TTL='600'
+HELP='no'
+
+# If there are no arguments then print the help message.
+if [[ -z "$1" ]]; then
+ HELP='yes'
+fi
+
+for i in "$@"; do
+  case $i in
+    --domain=*)
+      DOMAIN="${i#*=}"
+      shift
+      ;;
+    --subdomain=*)
+      SUBDOMAIN="${i#*=}"
+      shift
+      ;;
+    --ttl=*)
+      TTL="${i#*=}"
+      shift
+      ;;
+    --creds=*)
+      CREDS_FILE="${i#*=}"
+      shift
+      ;;
+    --help)
+      HELP='yes' 
+      shift
+      ;;
+    *)
+      echo "Unknown argument $i"
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$HELP" == 'yes' ]]; then
+  echo 'porkdd - A simple Porkbun Dynamic DNS client.
+
+Usage: porkdd --creds=$CREDS --domain=$DOMAIN [--subdomain=$SUBDOMAIN] [--ttl=$TTL]
+
+The creds file should be a JSON formatted file containing your Porkbun API credentials.
+To obtain Porkbun API credentials see https://kb.porkbun.com/article/190-getting-started-with-the-porkbun-api.
+
+Example:
+
+{
+  "secretapikey": "<YOUR SECRET API KEY>",
+  "apikey": "<YOUR API KEY>"
+}'
+  exit 0
+fi
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "Missing required flag --domain"
+  exit 1
+fi
+
+if ! [[ "$TTL" =~ ^[0-9]+$ ]]; then
+  echo "TTL must be an integer."
+  exit 1
+fi
+
+CREDS=$(cat "$CREDS_FILE")
+if [[ "$?" != "0" ]]; then
+  echo "Failed to read creds file: $CREDS_FILE"
+  exit 1
+fi
+
+echo "$CREDS" | jq -r "." 1>/dev/null
+if [[ "$?" != "0" ]]; then
+  echo "Failed to parse creds file: $CREDS_FILE"
+  exit 1
+fi
+
+API_KEY=$(echo "$CREDS" | jq -r ".apikey")
+if [[ "$API_KEY" == 'null' ]]; then
+  echo 'API key is null.'
+  exit 1
+fi
+
+SECRET_API_KEY=$(echo "$CREDS" | jq -r ".secretapikey")
+if [[ "$SECRET_API_KEY" == 'null' ]]; then
+  echo 'Secret API key is null.'
+  exit 1
+fi
+
+PING_URL='https://api.porkbun.com/api/json/v3/ping'
+GET_RECORD_BASE_URL='https://api.porkbun.com/api/json/v3/dns/retrieveByNameType'
+UPDATE_RECORD_BASE_URL='https://api.porkbun.com/api/json/v3/dns/editByNameType'
+CREATE_RECORD_URL="https://api.porkbun.com/api/json/v3/dns/create/$DOMAIN"
+RECORD_TYPE='A'
+
+if [ -z "$SUBDOMAIN" ]; then
+  GET_RECORD_URL="$GET_RECORD_BASE_URL/$DOMAIN/$RECORD_TYPE"
+  UPDATE_RECORD_URL="$UPDATE_RECORD_BASE_URL/$DOMAIN/$RECORD_TYPE"
+  HOST="${DOMAIN}"
+else
+  GET_RECORD_URL="$GET_RECORD_BASE_URL/$DOMAIN/$RECORD_TYPE/$SUBDOMAIN"
+  UPDATE_RECORD_URL="$UPDATE_RECORD_BASE_URL/$DOMAIN/$RECORD_TYPE/$SUBDOMAIN"
+  HOST="${SUBDOMAIN}.${DOMAIN}"
+fi
+
+RESPONSE=''
+
+function call_api {
+  local URL="$1"
+  local COMMAND="$2"
+  local ERROR_MSG="$3"
+
+  RESPONSE=$(curl \
+    --header 'Content-Type: application/json' \
+    --request 'POST' \
+    --data "$COMMAND" \
+    --silent \
+    "$URL")
+  local EXIT_CODE="$?"
+  if [[ "$EXIT_CODE" != "0" ]]; then
+    printf '%s: curl failed with: %s\n' "$ERROR_MSG" "$EXIT_CODE"
+    exit 1
+  fi
+
+  local STATUS=$(echo "$RESPONSE" | jq -r '.status')
+  local MESSAGE=$(echo "$RESPONSE" | jq -r '.message')
+  if [[ $STATUS != "SUCCESS" ]]; then
+    printf '%s: %s\n' "$ERROR_MSG" "$MESSAGE"
+    exit 1
+  fi
+}
+
+# Lookup this machine's public IP address.
+PING_COMMAND='{
+  "secretapikey": "'"$SECRET_API_KEY"'",
+  "apikey": "'"$API_KEY"'"
+}'
+
+call_api "$PING_URL" "$PING_COMMAND" 'Failed to get IP address'
+
+MY_IP=$(echo "$RESPONSE" | jq -r '.yourIp')
+
+# Check that MY_IP looks like an IPv4 address.
+if ! [[ "$MY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf 'Expected to get an IP address from %s.\n' "$IP_CHECK_URL"
+  exit 1
+fi
+
+# Lookup the IP address of the domain.
+GET_RECORD_COMMAND='{
+  "secretapikey": "'"$SECRET_API_KEY"'",
+  "apikey": "'"$API_KEY"'"
+}'
+
+call_api "$GET_RECORD_URL" "$GET_RECORD_COMMAND" 'Failed to lookup record'
+
+RECORD_COUNT=$(echo "$RESPONSE" | jq '.records | length')
+if [[ "$RECORD_COUNT" == "0" ]]; then
+  # Create a new record.
+  CREATE_RECORD_COMMAND='{
+    "secretapikey": "'"$SECRET_API_KEY"'",
+    "apikey": "'"$API_KEY"'",
+    "type": "'"$RECORD_TYPE"'",
+    "name": "'"$SUBDOMAIN"'",
+    "content": "'"$MY_IP"'",
+    "ttl": "'"$TTL"'"
+  }'
+
+  call_api "$CREATE_RECORD_URL" "$CREATE_RECORD_COMMAND" 'Failed to create record'
+
+  printf 'Created record for %s with value %s\n' "$HOST" "$MY_IP"
+else
+  HOST_IP=$(echo "$RESPONSE" | jq -r '.records[0].content')
+  if [[ "$HOST_IP" == "$MY_IP" ]]; then
+    # Nothing to do.
+    exit 0
+  fi
+
+  # Update the existing record.
+  UPDATE_RECORD_COMMAND='{
+    "secretapikey": "'"$SECRET_API_KEY"'",
+    "apikey": "'"$API_KEY"'",
+    "content": "'"$MY_IP"'",
+    "ttl": "'"$TTL"'"
+  }'
+
+  call_api "$UPDATE_RECORD_URL" "$UPDATE_RECORD_OMMAND" 'Failed to update record'
+
+  printf 'Updated record for %s to value %s\n' "$HOST" "$MY_IP"
+fi
+
